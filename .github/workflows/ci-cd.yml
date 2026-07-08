@@ -117,7 +117,7 @@ jobs:
           name: unit-test-reports
           path: |
             target/surefire-reports
-            target/site/jacoco
+          
             reports/unit-test-agent-report.md
           retention-days: 14
 
