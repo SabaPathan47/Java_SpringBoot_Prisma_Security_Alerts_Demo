@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <!--
+      Add suppressions here ONLY with a documented justification and expiry date.
+      Example:
+      <suppress until="2026-12-31Z">
+        <notes>False positive - not exploitable in our context, tracked in JIRA-1234</notes>
+        <packageUrl regex="true">^pkg:maven/some\.group/some-artifact@.*$</packageUrl>
+        <cve>CVE-2024-XXXXX</cve>
+      </suppress>
+    -->
+</suppressions>

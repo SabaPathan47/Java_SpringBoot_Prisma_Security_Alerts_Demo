@@ -1,0 +1,461 @@
+name: Claims Service CI/CD
+
+# ---------------------------------------------------------------------------
+# Trigger: push and pull_request against main and feature branches only.
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches: [main, feature]
+  pull_request:
+    branches: [main, feature]
+
+permissions:
+  contents: read
+  packages: write        # push image to GHCR
+  pull-requests: write   # post agent reports as PR comments
+  checks: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/claims-processing-service
+  JAVA_VERSION: "17"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # =========================================================================
+  # STAGE 1 — BUILD
+  # =========================================================================
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compile
+        run: mvn -B clean compile
+
+      - name: Generate build report
+        if: always()
+        run: |
+          mkdir -p reports
+          {
+            echo "# Build Stage Report"
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Commit: ${{ github.sha }}"
+            echo "Status: ${{ job.status }}"
+          } > reports/build-report.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            target/classes
+            reports/build-report.md
+          retention-days: 7
+
+  # =========================================================================
+  # STAGE 2 — UNIT TEST  (+ AI AGENT 1: Unit Test Quality Analyzer)
+  # =========================================================================
+  unit-test:
+    name: Unit Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run unit tests with coverage
+        run: mvn -B test
+
+      - name: Run Unit Test Analyzer Agent (Agent 1)
+        id: agent1
+        run: python3 agents/unit-test-agent/agent.py
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+      - name: Post Agent 1 report to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'reports/unit-test-agent-report.md';
+            if (fs.existsSync(path)) {
+              const body = fs.readFileSync(path, 'utf8');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            target/surefire-reports
+            target/site/jacoco
+            reports/unit-test-agent-report.md
+          retention-days: 14
+
+  # =========================================================================
+  # STAGE 3 — INTEGRATION TEST (Testcontainers spins up real Postgres)
+  # =========================================================================
+  integration-test:
+    name: Integration Test
+    needs: unit-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Run integration tests (Testcontainers + Failsafe)
+        run: mvn -B verify -DskipUnitTests -Dsurefire.skip=true
+
+      - name: Generate integration test report
+        if: always()
+        run: |
+          mkdir -p reports
+          {
+            echo "# Integration Test Stage Report"
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Status: ${{ job.status }}"
+            echo ""
+            echo "## Failsafe summary"
+            find target/failsafe-reports -name "*.txt" -exec cat {} \; 2>/dev/null || echo "No failsafe reports found."
+          } > reports/integration-test-report.md
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            target/failsafe-reports
+            reports/integration-test-report.md
+          retention-days: 14
+
+  # =========================================================================
+  # STAGE 4 — CODE QUALITY (static analysis gate, common in real pipelines)
+  # =========================================================================
+  code-quality:
+    name: Code Quality
+    needs: unit-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Run Checkstyle
+        run: mvn -B checkstyle:check || true   # non-blocking style gate
+
+      - name: Static analysis report
+        if: always()
+        run: |
+          mkdir -p reports
+          {
+            echo "# Code Quality Stage Report"
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Checkstyle executed (informational, non-blocking)."
+          } > reports/code-quality-report.md
+
+      - name: Upload code quality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-report
+          path: reports/code-quality-report.md
+          retention-days: 14
+
+  # =========================================================================
+  # STAGE 5 — SECURITY SCANNING (+ AI AGENT 2: Security Gatekeeper)
+  # OWASP Dependency-Check + Trivy (fs & image) + Prisma Cloud (twistcli)
+  # This stage BLOCKS the pipeline if the gatekeeper agent returns BLOCK.
+  # =========================================================================
+  security-scan:
+    name: Security Scan
+    needs: [integration-test, code-quality]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: OWASP Dependency-Check
+        run: mvn -B org.owasp:dependency-check-maven:check
+        continue-on-error: true   # let Agent 2 make the final call from the report
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sh -s -- -b /usr/local/bin
+
+      - name: Trivy filesystem scan (source + deps + secrets)
+        run: |
+          mkdir -p reports
+          trivy fs --format json --output reports/trivy-fs-report.json \
+            --scanners vuln,secret,misconfig . || true
+
+      - name: Build image for scanning
+        run: |
+          docker build -t local/claims-processing-service:scan .
+
+      - name: Trivy image scan
+        run: |
+          trivy image --format json --output reports/trivy-image-report.json \
+            local/claims-processing-service:scan || true
+
+      - name: Prisma Cloud (twistcli) image scan
+        if: ${{ secrets.PRISMA_COMPUTE_URL != '' }}
+        env:
+          PRISMA_COMPUTE_URL: ${{ secrets.PRISMA_COMPUTE_URL }}
+          PRISMA_ACCESS_KEY: ${{ secrets.PRISMA_ACCESS_KEY }}
+          PRISMA_SECRET_KEY: ${{ secrets.PRISMA_SECRET_KEY }}
+        run: |
+          curl -k -u "$PRISMA_ACCESS_KEY:$PRISMA_SECRET_KEY" \
+            --output ./twistcli \
+            "$PRISMA_COMPUTE_URL/api/v1/util/twistcli"
+          chmod +x ./twistcli
+          ./twistcli images scan \
+            --address "$PRISMA_COMPUTE_URL" \
+            -u "$PRISMA_ACCESS_KEY" -p "$PRISMA_SECRET_KEY" \
+            --output-file reports/prisma-image-report.json \
+            local/claims-processing-service:scan || true
+
+      - name: Skip note if Prisma Cloud not configured
+        if: ${{ secrets.PRISMA_COMPUTE_URL == '' }}
+        run: echo "PRISMA_COMPUTE_URL secret not set — Prisma Cloud scan skipped, Agent 2 will treat it as N/A (non-blocking)."
+
+      - name: Run Security Gatekeeper Agent (Agent 2)
+        id: agent2
+        run: python3 agents/security-agent/agent.py
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+      - name: Post Agent 2 report to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'reports/security-agent-report.md';
+            if (fs.existsSync(path)) {
+              const body = fs.readFileSync(path, 'utf8');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            target/dependency-check-report
+            reports/trivy-fs-report.json
+            reports/trivy-image-report.json
+            reports/prisma-image-report.json
+            reports/security-agent-report.md
+          retention-days: 30
+
+  # =========================================================================
+  # STAGE 6 — BUILD IMAGE & PUSH TO GHCR (only after security gate passes)
+  # =========================================================================
+  build-and-push:
+    name: Build & Push Image (GHCR)
+    needs: security-scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature')
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate image build report
+        run: |
+          mkdir -p reports
+          {
+            echo "# Image Build & Push Report"
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Registry: ${{ env.REGISTRY }}"
+            echo "Image: ${{ env.IMAGE_NAME }}"
+            echo "Tags: ${{ steps.meta.outputs.tags }}"
+            echo "Digest: ${{ steps.push.outputs.digest }}"
+          } > reports/image-build-report.md
+
+      - name: Upload image build report
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-build-report
+          path: reports/image-build-report.md
+          retention-days: 30
+
+  # =========================================================================
+  # STAGE 7 — DEPLOY  (+ AI AGENT 3: Deployment Readiness & Release Notes)
+  # Deploys to a standard target (self-hosted / VM / docker host over SSH).
+  # Only runs on push to main (production-style branch protection).
+  # =========================================================================
+  deploy:
+    name: Deploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so Agent 3 can read git log for release notes
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download unit-test agent report
+        uses: actions/download-artifact@v4
+        with:
+          name: unit-test-reports
+          path: reports-download/unit-test
+
+      - name: Download security agent report
+        uses: actions/download-artifact@v4
+        with:
+          name: security-reports
+          path: reports-download/security
+
+      - name: Stage agent reports for readiness check
+        run: |
+          mkdir -p reports
+          cp reports-download/unit-test/unit-test-agent-report.md reports/ 2>/dev/null || true
+          cp reports-download/security/security-agent-report.md reports/ 2>/dev/null || true
+
+      - name: Run Deployment Readiness Agent (Agent 3)
+        id: agent3
+        run: python3 agents/deployment-agent/agent.py
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy to target environment
+        if: success()
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          echo "Deploying $IMAGE:$TAG to $DEPLOY_HOST"
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key "$DEPLOY_HOST" "
+            docker pull $IMAGE:$TAG &&
+            docker compose -f /opt/claims-service/docker-compose.yml up -d --no-deps claims-service
+          " || echo "::warning::Deploy step is a template — configure DEPLOY_HOST/DEPLOY_SSH_KEY secrets for your real target."
+
+      - name: Post Agent 3 report to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'reports/deployment-readiness-report.md';
+            if (fs.existsSync(path)) {
+              const body = fs.readFileSync(path, 'utf8');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload deployment readiness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-readiness-report
+          path: reports/deployment-readiness-report.md
+          retention-days: 90
