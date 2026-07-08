@@ -41,14 +41,15 @@ class ClaimFlowIntegrationTest {
             .withUsername("it_user")
             .withPassword("it_pass");
 
-    @DynamicPropertySource
-    static void registerProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", postgres::getJdbcUrl);
-        registry.add("spring.datasource.username", postgres::getUsername);
-        registry.add("spring.datasource.password", postgres::getPassword);
-        registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
-        registry.add("spring.flyway.enabled", () -> "true");
-    }
+   @DynamicPropertySource
+static void registerProperties(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    registry.add("spring.datasource.username", postgres::getUsername);
+    registry.add("spring.datasource.password", postgres::getPassword);
+    registry.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver"); // add this
+    registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+    registry.add("spring.flyway.enabled", () -> "true");
+}
 
     @Autowired
     private MockMvc mockMvc;
