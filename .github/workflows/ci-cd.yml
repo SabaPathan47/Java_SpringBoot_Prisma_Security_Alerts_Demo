@@ -267,7 +267,7 @@ jobs:
             local/claims-processing-service:scan || true
 
       - name: Skip note if Prisma Cloud not configured
-        if: ${{ secrets.PRISMA_COMPUTE_URL == '' }}
+       
         run: echo "PRISMA_COMPUTE_URL secret not set — Prisma Cloud scan skipped, Agent 2 will treat it as N/A (non-blocking)."
 
       - name: Run Security Gatekeeper Agent (Agent 2)
