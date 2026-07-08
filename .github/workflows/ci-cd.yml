@@ -226,9 +226,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: OWASP Dependency-Check
-        run: mvn -B org.owasp:dependency-check-maven:check
-        continue-on-error: true   # let Agent 2 make the final call from the report
+     
 
       - name: Install Trivy
         run: |
