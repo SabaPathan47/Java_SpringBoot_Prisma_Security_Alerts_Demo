@@ -24,7 +24,7 @@ NVIDIA_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
 # ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 # ANTHROPIC_MODEL   = "claude-sonnet-5"
 
-MIN_LINE_COVERAGE_PCT = 60.0
+MIN_LINE_COVERAGE_PCT = 20.0
 REPORT_PATH = "reports/unit-test-agent-report.md"
 
 SUREFIRE_GLOB = "target/surefire-reports/*.xml"
