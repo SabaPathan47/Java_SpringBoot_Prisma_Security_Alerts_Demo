@@ -251,7 +251,6 @@ jobs:
             local/claims-processing-service:scan || true
 
       - name: Prisma Cloud (twistcli) image scan
-        if: ${{ secrets.PRISMA_COMPUTE_URL != '' }}
         env:
           PRISMA_COMPUTE_URL: ${{ secrets.PRISMA_COMPUTE_URL }}
           PRISMA_ACCESS_KEY: ${{ secrets.PRISMA_ACCESS_KEY }}
